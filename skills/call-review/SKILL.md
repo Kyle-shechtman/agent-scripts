@@ -46,9 +46,15 @@ the worst of it into prompt and code fixes.
 4. **Verify.** Open the transcript for every high-severity finding and confirm
    the quote, its timestamp, and the claimed missing evidence yourself.
    Reviewers misread tool results; drop or downgrade what does not hold, and
-   reject fixes that remove a safety net. Merge the verified findings into
-   `all_findings.json`.
-   Done when: every high-severity finding is marked `verified` or `rejected`.
+   reject fixes that remove a safety net. Check each `should_flag` names the
+   question whose "no" would have caught it. Merge the verified findings into
+   `all_findings.json`, then run `scripts/judge_misses.py <out>`: it adds the
+   jury's stored verdict to each finding and writes `judge_misses.json`. A
+   finding whose question said yes is a judge miss; findings with
+   `should_flag` null are `unassigned` and feed the new-question themes in
+   `jev-judge-improvement`.
+   Done when: every high-severity finding is marked `verified` or `rejected`,
+   and `judge_misses.py` exits 0.
 
 5. **Report** using the output template. Group findings into patterns by
    cause, not by call.
@@ -71,7 +77,7 @@ the worst of it into prompt and code fixes.
 # Call review: <window>, <n> calls, prompts <tags>
 
 ## Hallucinations
-| Call | At | Said | Truth | Cause | Judges missed |
+| Call | At | Said | Truth | Cause | Should flag |
 
 ## Patterns
 1. <pattern>: <n> calls (<call numbers>). Cause: <component>.
@@ -81,7 +87,8 @@ the worst of it into prompt and code fixes.
 - <tool or platform change>: <calls>
 
 ## Judges missed
-<findings the built-in judges scored well, by judge>
+| Question | Findings | Missed (said yes) | Caught | Not judged |
+No question fits: <n> findings (to the theme ledger)
 
 ## Stats
 <odd numbers from step 2, one line each>

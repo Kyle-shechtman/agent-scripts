@@ -5,7 +5,7 @@ Usage: pull_calls.py --date YYYY-MM-DD [--days N] --out DIR [--s2s PATH]
 
 Writes to DIR (which must be empty and outside any git repository):
   calls/call-NNN.md   one file per call: metadata, judges, full transcript
-  index.json          call number -> interaction id, start, prompt tag
+  index.json          call number -> interaction id, start, prompt tag, jury verdicts
   stats.json          cheap stats to read before any transcript
   batches.json        size-balanced batches of call files for reviewers
   prompts/<tag>/      speaker.md and thinker.md as they were at each tag
@@ -207,6 +207,20 @@ def render_call(number, c):
     return "\n".join(out) + "\n"
 
 
+def judge_verdicts(c):
+    """The jury's stored yes/no verdict per question: True, False, "not_applicable", or "error"."""
+    evaluation = (c.get("closeout") or {}).get("evaluation") or {}
+    verdicts = {}
+    for question, result in (evaluation.get("results") or {}).items():
+        if result.get("status") == "not_applicable":
+            verdicts[question] = "not_applicable"
+        elif isinstance(result.get("verdict"), bool):
+            verdicts[question] = result["verdict"]
+    for question in evaluation.get("errors") or {}:
+        verdicts[question] = "error"
+    return verdicts
+
+
 def tool_outcome(item):
     """Abita tools answer "<outcome>: <answer>"; errors raised by the runtime set is_error."""
     if item.get("is_error"):
@@ -358,7 +372,7 @@ def main():
         text = render_call(number, c)
         (out / name).write_text(text)
         sizes[name] = len(text)
-        index.append({"call": number, "id": c["id"], "started_at": c["started_at"], "prompts": prompt_tag(c)})
+        index.append({"call": number, "id": c["id"], "started_at": c["started_at"], "prompts": prompt_tag(c), "judges": judge_verdicts(c)})
 
     stats = compute_stats(calls)
     stats["window_utc"] = [start.isoformat(), end.isoformat()]
