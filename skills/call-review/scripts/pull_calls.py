@@ -9,11 +9,14 @@ Writes to DIR (which must be empty and outside any git repository):
   stats.json          cheap stats to read before any transcript
   batches.json        size-balanced batches of call files for reviewers
   prompts/<tag>/      speaker.md and thinker.md as they were at each tag
+  judge_questions.json  the --s2s checkout's evaluator version and failure questions
+                      (judges whose docstring names a "Fix for a no:"), for should_flag
 
 The database credential stays in this process's memory and is never written.
 """
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -34,6 +37,7 @@ SECRET = "acuity-product-east1-portal-database-url"
 PORT = 54329
 ZONE = ZoneInfo("America/New_York")
 BATCHES = 6
+JUDGES = "src/abita_s2s/observability"
 PROMPTS = {"speaker.md": "src/abita_s2s/prompts/speaker.md", "thinker.md": "src/abita_s2s/prompts/thinker.md"}
 
 QUERY = """
@@ -221,6 +225,27 @@ def judge_verdicts(c):
     return verdicts
 
 
+def assigned(tree, name):
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return node.value
+    sys.exit(f"{name} not found in the abita_s2s judges")
+
+
+def judge_questions(s2s):
+    """The evaluator version and every registered judge that names the fix its "no" points to."""
+    root = s2s / JUDGES
+    version = ast.literal_eval(assigned(ast.parse((root / "evaluation.py").read_text()), "EVALUATOR_VERSION"))
+    keys = [ast.literal_eval(k) for k in assigned(ast.parse((root / "judges" / "__init__.py").read_text()), "QUESTIONS").keys]
+    questions = {}
+    for key in keys:
+        module = ast.parse((root / "judges" / f"{key}.py").read_text())
+        fix = re.search(r"Fix for a no: (.+)", ast.get_docstring(module) or "")
+        if fix:
+            questions[key] = {"fix": fix.group(1).strip(), "instructions": ast.literal_eval(assigned(module, "QUESTION"))["instructions"]}
+    return {"version": version, "questions": questions}
+
+
 def tool_outcome(item):
     """Abita tools answer "<outcome>: <answer>"; errors raised by the runtime set is_error."""
     if item.get("is_error"):
@@ -360,7 +385,9 @@ def main():
     parser.add_argument("--s2s", type=Path, default=Path.home() / "abita_s2s")
     args = parser.parse_args()
 
+    judges = judge_questions(args.s2s)
     out = prepare_out(args.out)
+    (out / "judge_questions.json").write_text(json.dumps(judges, indent=2))
     start, end = day_window(args.date, args.days)
     calls = fetch_calls(start, end)
     if not calls:
@@ -372,10 +399,14 @@ def main():
         text = render_call(number, c)
         (out / name).write_text(text)
         sizes[name] = len(text)
-        index.append({"call": number, "id": c["id"], "started_at": c["started_at"], "prompts": prompt_tag(c), "judges": judge_verdicts(c)})
+        evaluation = (c.get("closeout") or {}).get("evaluation") or {}
+        index.append({"call": number, "id": c["id"], "started_at": c["started_at"], "prompts": prompt_tag(c),
+                      "judge_version": evaluation.get("evaluatorVersion"), "judges": judge_verdicts(c)})
 
     stats = compute_stats(calls)
     stats["window_utc"] = [start.isoformat(), end.isoformat()]
+    stats["judge_questions"] = {"version": judges["version"], "failure_questions": sorted(judges["questions"]),
+                                "calls_on_this_version": sum(1 for row in index if row["judge_version"] == judges["version"])}
     stats["prompts_missing"] = export_prompts(args.s2s, {t for t in (prompt_tag(c) for c in calls) if t}, out)
     (out / "index.json").write_text(json.dumps(index, indent=2))
     (out / "stats.json").write_text(json.dumps(stats, indent=2))

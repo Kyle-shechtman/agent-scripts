@@ -48,20 +48,9 @@ birth, or other identifiers in your findings, even in quotes; replace them
 with [name], [phone], [dob].
 
 For each finding, name in should_flag the one judge question whose "no"
-should have caught it, or null when none fits:
-- requested_time_honored: a requested day or time was not offered or plainly
-  declined before other times.
-- insurance_plan_as_stated: check_insurance dropped or changed the caller's
-  plan words, or was not rerun after the caller corrected them.
-- office_rules_grounded: an office or patient-record fact no earlier tool
-  result supports.
-- appointment_datetime_correct: a booking, reschedule, or cancel result does
-  not match the caller's final date and time.
-- promises_backed: a claim about what happened or will happen next (a
-  callback, a message sent, a booking) that no tool result supports.
-- ended_while_caller_active: the agent ended the call while the caller was
-  still talking or asking.
-- office_question_answered: an office question the agent could not answer.
+should have caught it, or null when none fits. The questions, what each asks,
+and the fix its "no" points to are in <out>/judge_questions.json; use its keys
+exactly.
 
 Write a JSON array:
 [{"call": 12, "category": "hallucination|failure|improvement",

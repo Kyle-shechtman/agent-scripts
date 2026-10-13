@@ -3,9 +3,12 @@
 
 Usage: judge_misses.py OUT
 
-Reads OUT/index.json (each call's stored jury verdicts) and OUT/all_findings.json
-(each finding's `should_flag`: the judge question whose "no" should have caught
-it, or null). Adds `judge_verdict` to every finding and writes OUT/judge_misses.json:
+Reads OUT/judge_questions.json (the failure questions and evaluator version from
+abita_s2s), OUT/index.json (each call's stored jury verdicts and their version), and
+OUT/all_findings.json (each finding's `should_flag`: the question whose "no" should
+have caught it, or null). A verdict from another evaluator version is not judged:
+its wording differs. Adds `judge_verdict` to every finding and writes
+OUT/judge_misses.json:
 
   by_question  question -> findings, missed (the jury said yes: a judge miss),
                caught (it said no), not_judged (no stored verdict), as call ids
@@ -18,20 +21,8 @@ import json
 import sys
 from pathlib import Path
 
-# typesafe-scorecard-v7 failure questions. Facts (new_booking_requested,
-# time_offered) and the sentiment score are not failures.
-QUESTIONS = (
-    "requested_time_honored",
-    "insurance_plan_as_stated",
-    "office_rules_grounded",
-    "appointment_datetime_correct",
-    "promises_backed",
-    "ended_while_caller_active",
-    "office_question_answered",
-)
-
-
-def tally(index, findings):
+def tally(judges, index, findings):
+    questions = sorted(judges["questions"])
     calls = {row["call"]: row for row in index}
     by_question, unassigned = {}, []
     for finding in findings:
@@ -43,9 +34,10 @@ def tally(index, findings):
             finding["judge_verdict"] = None
             unassigned.append({"call": call["call"], "id": call["id"]})
             continue
-        if question not in QUESTIONS:
-            sys.exit(f"finding on call {finding['call']} names {question!r}; should_flag must be one of {', '.join(QUESTIONS)} or null")
-        verdict = call.get("judges", {}).get(question, "not_judged")
+        if question not in questions:
+            sys.exit(f"finding on call {finding['call']} names {question!r}; should_flag must be one of {', '.join(questions)} or null")
+        current = call.get("judge_version") == judges["version"]
+        verdict = call.get("judges", {}).get(question, "not_judged") if current else "not_judged"
         finding["judge_verdict"] = verdict
         row = by_question.setdefault(question, {"findings": 0, "missed": [], "caught": [], "not_judged": []})
         row["findings"] += 1
@@ -60,9 +52,10 @@ def main(argv=None):
     if len(args) != 1:
         sys.exit(__doc__)
     out = Path(args[0])
+    judges = json.loads((out / "judge_questions.json").read_text())
     index = json.loads((out / "index.json").read_text())
     findings = json.loads((out / "all_findings.json").read_text())
-    result = tally(index, findings)
+    result = tally(judges, index, findings)
     (out / "all_findings.json").write_text(json.dumps(findings, indent=2))
     (out / "judge_misses.json").write_text(json.dumps(result, indent=2))
     summary = {q: {k: v if k == "findings" else len(v) for k, v in row.items()} for q, row in result["by_question"].items()}

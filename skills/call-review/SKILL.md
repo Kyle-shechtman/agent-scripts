@@ -22,8 +22,12 @@ the worst of it into prompt and code fixes.
 1. **Pull.** Run, with a New York calendar day:
 
    ```bash
-   ~/acuity_business/skills/call-review/scripts/pull_calls.py --date YYYY-MM-DD [--days N] --out <scratchpad>/calls-YYYY-MM-DD
+   ~/acuity_business/skills/call-review/scripts/pull_calls.py --date YYYY-MM-DD [--days N] --out <scratchpad>/calls-YYYY-MM-DD --s2s <abita_s2s checkout>
    ```
+
+   `--s2s` must hold the judge set that was live; `judge_questions.json` lists
+   its failure questions for `should_flag`, and only verdicts from its
+   evaluator version count in step 4.
 
    It opens a read-only session through the Cloud SQL proxy, renders one file
    per call with full tool results, and exports the prompts that were live for
