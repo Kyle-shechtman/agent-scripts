@@ -1,5 +1,12 @@
+import argparse
+import asyncio
+import contextlib
+import io
+import json
+import os
 import sys
 import tempfile
+from unittest import mock
 import unittest
 from pathlib import Path
 
@@ -7,13 +14,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import candidates  # noqa: E402
 import golden  # noqa: E402
 
-A, B, C, D = (f"0000000{n}-0000-0000-0000-000000000000" for n in "abcd")
+A, B, C, D, E = (f"0000000{n}-0000-0000-0000-000000000000" for n in "abcde")
 
 
 def row(call, question, answer, reviewer="kyle", judge=None, reviewed_at="2026-10-08T18:00:00+00:00"):
     return {"interaction_id": call, "question": question, "reviewer": reviewer, "answer": answer, "review_date": "2026-10-07", "reviewed_at": reviewed_at, "judge_answer": judge}
 
 
+FAKE_S2S = {
+    "livekit/__init__.py": "",
+    "livekit/agents/__init__.py": "class ChatContext:\n    @staticmethod\n    def from_dict(data):\n        return data\n",
+    "abita_s2s/__init__.py": "",
+    "abita_s2s/observability/__init__.py": "",
+    "abita_s2s/observability/judges/__init__.py": "JURORS = ('j',)\nQUESTIONS = {'right_help': {'type': 'noul'}, 'expressed_sentiment': {'type': 'score'}}\n",
+    "abita_s2s/observability/evaluation.py": (
+        "CALLS = []\n"
+        "async def evaluate_judges(history, *, api_key, seconds):\n"
+        "    CALLS.append({'api_key': api_key, 'seconds': seconds})\n"
+        "    return {'results': {'right_help': {'verdict': False, 'probability': 0.2, 'votes': {'j': 0.2}, 'errors': {}},"
+        " 'expressed_sentiment': {'score': 2, 'votes': {'j': 2}, 'errors': {}}}, 'errors': {}}\n"
+    ),
+}
 EARLIER = "2026-10-01T18:00:00+00:00"
 
 
@@ -78,11 +99,6 @@ class GoldenTest(unittest.TestCase):
         self.assertEqual(golden.gate_new(calls, evidence, answers, "new_q")["false_alarms"], [B[:8]])
         self.assertFalse(golden.gate_new(calls, evidence[:9], answers, "new_q")["pass"])
 
-    def test_misses_today_ignores_earlier_sets(self):
-        calls = self.golden()
-        answers = {A: {"right_help": v(0.9)}, B: {"right_help": v(0.1)}, C: {"right_help": v(0.9)}}
-        self.assertEqual(golden.misses_today(calls, answers), {"right_help": [A[:8]]})
-
     def test_gate_skips_are_misses_on_evidence_and_quiet_on_golden_calls(self):
         calls = self.golden()
         evidence = [f"{n:08x}-1111-0000-0000-000000000000" for n in range(10)]
@@ -101,11 +117,41 @@ class GoldenTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             golden.ensure_out(Path(__file__).resolve().parent / "missing" / "deeper", fresh=True)
 
-    def test_majority_of_repeated_runs_and_errors_stay_visible(self):
-        tries = [{"q": v(0.53), "e": v(0.9), "n": "not_applicable"}, {"q": v(0.37), "e": "error:TimeoutError", "n": "not_applicable"}, {"q": v(0.49), "e": v(0.8), "n": "not_applicable"}]
-        merged = golden.merge_runs(tries)
-        self.assertEqual(merged["q"], {"verdict": True, "probability": 0.49, "votes": {"typesafe-ai/jev": 0.49}})
-        self.assertEqual((merged["e"], merged["n"]), ("error:TimeoutError", "not_applicable"))
+    def test_false_alarms_and_misses_by_question_with_call_review_misses_only(self):
+        calls = self.golden()
+        answers = {A: {"right_help": v(0.9)}, B: {"right_help": v(0.1)}, C: {"right_help": v(0.9)}, E: {"right_help": v(0.9)}}
+        self.assertEqual(golden.disagreements(calls, answers, {"right_help": [E]}), {"right_help": {"misses": [A[:8]], "call_review_misses": [E[:8]]}})
+        self.assertEqual(golden.counts(calls, answers), {"right_help": {"agreed": 0, "false_alarms": 1, "misses": 2}})
+
+    def test_a_reword_that_fixes_a_call_review_miss_passes_and_breaking_one_is_a_regression(self):
+        calls = self.golden()
+        baseline = {A: {"right_help": v(0.2)}, B: {"right_help": v(0.9)}, C: {"right_help": v(0.2)}, E: {"right_help": v(0.9)}}
+        fixed = {**baseline, E: {"right_help": v(0.1)}}
+        result = golden.gate_reword(calls, baseline, fixed, "right_help", [E])
+        self.assertEqual((result["pass"], result["fixed_today"]), (True, [E[:8]]))
+        self.assertEqual(result["sets"]["call-review"], {"compared": 1, "before": 0, "after": 1})
+        broken = golden.gate_reword(calls, fixed, baseline, "right_help", [E])
+        self.assertEqual(broken["regressions"], [{"call": E[:8], "set": "call-review"}])
+
+    def test_run_asks_the_full_batch_once_like_production_and_keeps_yes_no_answers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path, text in FAKE_S2S.items():
+                (root / "s2s" / "src" / path).parent.mkdir(parents=True, exist_ok=True)
+                (root / "s2s" / "src" / path).write_text(text)
+            out = root / "out"
+            out.mkdir()
+            calls = self.golden()
+            (out / "golden.json").write_text(json.dumps({"today": "2026-10-08", "evidence": [], "call_review": {}, "calls": calls}))
+            (out / "transcripts.json").write_text(json.dumps({A: {"items": []}, B: {"items": []}, C: {"items": []}}))
+            args = argparse.Namespace(s2s=root / "s2s", out=out, name="t")
+            with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test"}), contextlib.redirect_stdout(io.StringIO()):
+                asyncio.run(golden.run_jev(args))
+            from abita_s2s.observability import evaluation
+            self.assertEqual(evaluation.CALLS, [{"api_key": "test", "seconds": 120}] * 3)
+            answers = json.loads((out / "runs" / "t.json").read_text())["answers"]
+            self.assertEqual(answers[A], {"right_help": {"verdict": False, "probability": 0.2, "votes": {"j": 0.2}}})
+            self.assertEqual(answers[D], {"right_help": "error:no_transcript"})
 
     def test_answer_of_reads_the_jury_result(self):
         judged = {"results": {"a": {"verdict": False, "probability": 0.2, "votes": {"j": 0.2}, "errors": {}}, "g": {"status": "not_applicable", "reason": "x"}}, "errors": {"b": {"cause": "no_quorum"}}}

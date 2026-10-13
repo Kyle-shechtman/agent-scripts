@@ -2,26 +2,32 @@
 """Backtest Jev questions on every golden set, so no rewording or new question regresses.
 
   pull     read-only: every human golden-set answer, the reviewers' missing-question
-           notes, and the transcripts Jev needs. Prints what production Jev got
-           wrong on today's set.
-  run      ask the seated jury the questions as worded in an abita_s2s checkout, through
-           its own evaluator, on every golden call (and any evidence calls), and print
-           today's misses for that wording. Run with the abita_s2s virtualenv.
-  compare  gate a candidate run against a baseline run.
+           notes, and the transcripts the jury needs. Prints what production got
+           wrong on today's set. --call-review adds call-review's judge misses.
+  run      ask the seated jury the full question batch as worded in an abita_s2s
+           checkout, once, through its own evaluator, exactly as production does, on
+           every golden call (and any extra calls). Prints false alarms and misses per
+           question. Run with the abita_s2s virtualenv.
+  compare  gate one question of a candidate run against a baseline run.
 
 Usage:
-  golden.py pull --out DIR [--today YYYY-MM-DD] [--evidence ID,ID]
-  <s2s>/.venv/bin/python golden.py run --out DIR --s2s PATH --name NAME [--questions K,K]
+  golden.py pull --out DIR [--today YYYY-MM-DD] [--call-review FILE] [--evidence ID,ID]
+  <s2s>/.venv/bin/python golden.py run --out DIR --s2s PATH --name NAME
   golden.py compare --out DIR --question KEY --baseline NAME --candidate NAME
   golden.py compare --out DIR --question KEY --candidate NAME --new
+
+A "no" flags a failure. A false alarm is the jury saying no where the humans said
+yes; a miss is the jury saying yes where the humans said no. Golden answers
+measure both. call-review findings measure misses only: each one is a call
+where its question should have said no.
 
 "Today" is the Pacific calendar day whose reviews are judged; it defaults to
 yesterday, because the nightly run starts at midnight Pacific. DIR must be
 outside any git repository. Output names calls by the first 8 characters of
 their interaction id and never prints transcript text or notes.
 
-The gateway key comes from AI_GATEWAY_API_KEY or, failing that, the macOS
-keychain item "acuity-ai-gateway". It is never written or printed.
+The OpenRouter key comes from OPENROUTER_API_KEY or, failing that, the macOS
+keychain item "acuity-openrouter". It is never written or printed.
 """
 
 import argparse
@@ -32,7 +38,6 @@ import json
 import os
 import re
 import socket
-import statistics
 import subprocess
 import sys
 import time
@@ -45,10 +50,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "call-review" / "sc
 import pull_calls  # noqa: E402
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
-NO_AT_OR_BELOW = 0.40
-UNJUDGEABLE = {"error:no_transcript", "error:no_instructions"}
+UNJUDGEABLE = {"error:no_transcript"}
 NEW_QUESTION_MIN_EVIDENCE = 10
-BOOKING_QUESTIONS = {"booking_requested", "time_offered"}
+FACT_QUESTIONS = {"booking_requested", "new_booking_requested", "time_offered"}  # v6 and v7 names
 NOT_APPLICABLE_MEANS_NO = {"time_offered"}
 GOLDEN_EXISTS = "select to_regclass('public.ai_call_reviews') is not null"
 GOLDEN_QUERY = """
@@ -198,23 +202,49 @@ def today_summary(golden):
     }
 
 
-def misses_today(golden, answers):
-    """Today's golden answers this run disagrees with, by question."""
-    misses = {}
-    for interaction_id, call in sorted(golden.items()):
+def disagreements(calls, answers, call_review):
+    """Per question: today's golden calls where this run said no but the humans said yes
+    (false alarms) or yes where they said no (misses), and call-review findings it still
+    says yes on."""
+    result = {}
+    for interaction_id, call in sorted(calls.items()):
         if not call["today"]:
             continue
         for question, human in call["truth"].items():
             no = answered_no(answers.get(interaction_id, {}).get(question), question)
-            if no is not None and (not no) != human:
-                misses.setdefault(question, []).append(short(interaction_id))
-    return misses
+            if no is None or (not no) == human:
+                continue
+            kind = "false_alarms" if no else "misses"
+            result.setdefault(question, {}).setdefault(kind, []).append(short(interaction_id))
+    for question, ids in sorted(call_review.items()):
+        missed = [short(i) for i in ids if answered_no(answers.get(i, {}).get(question), question) is False]
+        if missed:
+            result.setdefault(question, {})["call_review_misses"] = missed
+    return result
 
 
-def gate_reword(golden, baseline, candidate, question):
-    """A rewording ships only if it fixes a miss and no golden call that agreed before now disagrees."""
+def counts(calls, answers):
+    """Per question across every golden set: agreed, false alarms, misses."""
+    table = {}
+    for interaction_id, call in calls.items():
+        for question, human in call["truth"].items():
+            no = answered_no(answers.get(interaction_id, {}).get(question), question)
+            if no is None:
+                continue
+            row = table.setdefault(question, {"agreed": 0, "false_alarms": 0, "misses": 0})
+            row["agreed" if (not no) == human else "false_alarms" if no else "misses"] += 1
+    return dict(sorted(table.items()))
+
+
+def gate_reword(golden, baseline, candidate, question, call_review=()):
+    """A rewording ships only if it fixes a disagreement and no call that agreed before now disagrees.
+
+    call-review findings for the question count as today's calls whose truth is no.
+    """
     sets, fixed, regressions, errors, unjudged = {}, [], [], [], []
-    for interaction_id, call in sorted(golden.items()):
+    calls = {i: {"truth": {question: False}, "reviewed_day": "call-review", "today": True} for i in call_review}
+    calls.update(golden)
+    for interaction_id, call in sorted(calls.items()):
         truth = call["truth"].get(question)
         if truth is None:
             continue
@@ -252,7 +282,7 @@ def gate_reword(golden, baseline, candidate, question):
 
 def clean(call):
     """A golden call humans passed: no failure answered no and no missing-question note."""
-    return not call["noted"] and not call["split"] and all(answer for q, answer in call["truth"].items() if q not in BOOKING_QUESTIONS)
+    return not call["noted"] and not call["split"] and all(answer for q, answer in call["truth"].items() if q not in FACT_QUESTIONS)
 
 
 def gate_new(golden, evidence, candidate, question):
@@ -284,13 +314,13 @@ def gate_new(golden, evidence, candidate, question):
     }
 
 
-def gateway_key():
-    key = os.environ.get("AI_GATEWAY_API_KEY")
+def openrouter_key():
+    key = os.environ.get("OPENROUTER_API_KEY")
     if key:
         return key
-    found = subprocess.run(["security", "find-generic-password", "-s", "acuity-ai-gateway", "-w"], capture_output=True, text=True)
+    found = subprocess.run(["security", "find-generic-password", "-s", "acuity-openrouter", "-w"], capture_output=True, text=True)
     if found.returncode != 0 or not found.stdout.strip():
-        sys.exit("no gateway key: set AI_GATEWAY_API_KEY or add the keychain item acuity-ai-gateway")
+        sys.exit("no OpenRouter key: set OPENROUTER_API_KEY or add the keychain item acuity-openrouter")
     return found.stdout.strip()
 
 
@@ -308,7 +338,10 @@ def ensure_out(out, fresh):
 def pull(args):
     out = ensure_out(args.out, fresh=True)
     today = args.today or (datetime.now(PACIFIC).date() - timedelta(days=1)).isoformat()
-    evidence = [i for i in args.evidence.split(",") if i]
+    call_review = {}
+    if args.call_review:
+        call_review = {q: row["missed"] for q, row in json.loads(args.call_review.read_text())["by_question"].items() if row["missed"]}
+    evidence = sorted({i for i in args.evidence.split(",") if i} | {i for ids in call_review.values() for i in ids})
     with database() as query:
         if query(GOLDEN_EXISTS) != ["t"]:
             sys.exit("ai_call_reviews is not in this database yet: ship the portal review tables first")
@@ -325,13 +358,14 @@ def pull(args):
                 call = json.loads(line)
                 transcripts[call["id"]] = call["transcript"]
     golden = build_golden(rows, notes, today)
-    (out / "golden.json").write_text(json.dumps({"today": today, "evidence": evidence, "calls": golden}, indent=1))
+    (out / "golden.json").write_text(json.dumps({"today": today, "evidence": evidence, "call_review": call_review, "calls": golden}, indent=1))
     (out / "notes.json").write_text(json.dumps(notes, indent=1))
     (out / "transcripts.json").write_text(json.dumps(transcripts))
     summary = today_summary(golden)
     summary["today"] = today
     summary["database"] = database_label()
     summary["today_review_dates"] = sorted({call["review_date"] for call in golden.values() if call["today"]})
+    summary["call_review_misses"] = {q: len(ids) for q, ids in call_review.items()}
     summary["question_notes"] = {"total": len(notes), "today": sum(1 for n in notes if golden.get(n["interaction_id"], {}).get("today"))}
     summary["missing_transcripts"] = [short(i) for i in ids if i not in transcripts]
     print(json.dumps(summary, indent=1))
@@ -348,29 +382,6 @@ def answer_of(judged, question):
     return {"verdict": result["verdict"], "probability": result["probability"], "votes": result["votes"]}
 
 
-def merge_runs(tries):
-    """Decision models flip about 1% of answers between identical runs; the majority of several runs is stable."""
-    merged = {}
-    for question in tries[0]:
-        values = [t[question] for t in tries]
-        errors = [v for v in values if is_error(v)]
-        if errors:
-            merged[question] = errors[0]
-        elif all(v == "not_applicable" for v in values):
-            merged[question] = "not_applicable"
-        else:
-            answered = [v for v in values if isinstance(v, dict)]
-            probability = round(statistics.median(v["probability"] for v in answered), 3)
-            yes = sum(v["verdict"] for v in answered)
-            jurors = {juror for v in answered for juror in v["votes"]}
-            merged[question] = {
-                "verdict": yes * 2 > len(answered) or (yes * 2 == len(answered) and probability > NO_AT_OR_BELOW),
-                "probability": probability,
-                "votes": {j: round(statistics.median(v["votes"][j] for v in answered if j in v["votes"]), 3) for j in sorted(jurors)},
-            }
-    return merged
-
-
 def wording(question):
     return hashlib.sha256(json.dumps(question, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -384,17 +395,9 @@ async def run_jev(args):
     out = ensure_out(args.out, fresh=False)
     data = json.loads((out / "golden.json").read_text())
     transcripts = json.loads((out / "transcripts.json").read_text())
-    keys = [k for k in args.questions.split(",") if k] or [k for k, q in QUESTIONS.items() if q["type"] == "boolean"]
-    unknown = [k for k in keys if k not in QUESTIONS]
-    if unknown:
-        sys.exit(f"unknown questions {unknown} in {args.s2s}; known: {', '.join(QUESTIONS)}")
-    key = gateway_key()
-    if args.repeat < 1:
-        sys.exit("--repeat must be at least 1")
-    if args.today_only:
-        targets = sorted(i for i, call in data["calls"].items() if call["today"])
-    else:
-        targets = sorted(set(data["calls"]) | set(data["evidence"]))
+    keys = [k for k, q in QUESTIONS.items() if q["type"] == "noul"]
+    key = openrouter_key()
+    targets = sorted(set(data["calls"]) | set(data["evidence"]))
     semaphore = asyncio.Semaphore(4)
 
     async def one(interaction_id):
@@ -402,35 +405,36 @@ async def run_jev(args):
         if not transcript:
             return interaction_id, {q: "error:no_transcript" for q in keys}
         history = ChatContext.from_dict(transcript.get("chat_history") or transcript.get("chatHistory") or transcript)
-        purpose = next((i.instructions for i in reversed(history.items) if i.type == "agent_config_update" and i.instructions), None)
-        if not purpose:
-            return interaction_id, {q: "error:no_instructions" for q in keys}
-        tries = []
-        for _ in range(args.repeat):
-            async with semaphore:
-                judged = await evaluate_judges(history, agent_purpose=str(purpose), api_key=key, seconds=120, questions=keys)
-            tries.append({q: answer_of(judged, q) for q in keys})
-        return interaction_id, merge_runs(tries)
+        async with semaphore:
+            # The whole batch in one request, as production asks it; repeat runs agree on 99%+ of verdicts.
+            judged = await evaluate_judges(history, api_key=key, seconds=120)
+        return interaction_id, {q: answer_of(judged, q) for q in keys}
 
     answers = dict(await asyncio.gather(*(one(i) for i in targets)))
     runs = out / "runs"
     runs.mkdir(exist_ok=True)
     (runs / f"{args.name}.json").write_text(json.dumps({"s2s": str(args.s2s), "jurors": list(JURORS), "wording": {k: wording(QUESTIONS[k]) for k in keys}, "answers": answers}, indent=1))
     errors = sorted({v for a in answers.values() for v in a.values() if is_error(v)})
-    print(json.dumps({"run": args.name, "jurors": list(JURORS), "calls": len(answers), "questions": keys, "errors": errors, "misses_today": misses_today(data["calls"], answers)}, indent=1))
+    print(json.dumps({
+        "run": args.name, "jurors": list(JURORS), "calls": len(answers), "questions": keys, "errors": errors,
+        "wrong_today": disagreements(data["calls"], answers, data.get("call_review", {})),
+        "all_sets": counts(data["calls"], answers),
+    }, indent=1))
 
 
 def compare(args):
     out = ensure_out(args.out, fresh=False)
     data = json.loads((out / "golden.json").read_text())
     candidate = json.loads((out / "runs" / f"{args.candidate}.json").read_text())["answers"]
+    if not any(args.question in a for a in candidate.values()):
+        sys.exit(f"{args.candidate} has no answers for {args.question}")
     if args.new:
         result = gate_new(data["calls"], data["evidence"], candidate, args.question)
     else:
         if not args.baseline:
             sys.exit("--baseline is required unless --new")
         baseline = json.loads((out / "runs" / f"{args.baseline}.json").read_text())["answers"]
-        result = gate_reword(data["calls"], baseline, candidate, args.question)
+        result = gate_reword(data["calls"], baseline, candidate, args.question, data.get("call_review", {}).get(args.question, []))
     print(json.dumps(result, indent=1))
     sys.exit(0 if result["pass"] else 1)
 
@@ -441,14 +445,12 @@ def main():
     p = sub.add_parser("pull")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--today", type=lambda v: date.fromisoformat(v).isoformat())
+    p.add_argument("--call-review", type=Path, help="judge_misses.json from a call-review run: misses only")
     p.add_argument("--evidence", default="", help="interaction ids a new question must answer no on")
     r = sub.add_parser("run")
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--s2s", type=Path, required=True)
     r.add_argument("--name", required=True)
-    r.add_argument("--questions", default="")
-    r.add_argument("--repeat", type=int, default=3, help="runs per call; the majority verdict is kept")
-    r.add_argument("--today-only", action="store_true", help="only today's golden calls, to find today's misses")
     c = sub.add_parser("compare")
     c.add_argument("--out", type=Path, required=True)
     c.add_argument("--question", required=True)

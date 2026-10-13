@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Track new-question candidates until a theme has enough calls to backtest.
 
-A theme is a failure no judge question covers. Each call that shows it, from a
-reviewer's missing-question note (or a false alarm that really shows it), is counted once. A
-theme is ready at 10 calls; it is added only after Kyle or Chase approve it.
+A theme is a failure no judge question covers. Each call that shows it is counted
+once: a reviewer's missing-question note, a call-review finding no question should
+have caught, or a false alarm that really shows it. A theme is ready at 10 calls;
+it is added only after Kyle or Chase approve it.
 
 Usage:
   candidates.py show
-  candidates.py add KEY --call ID --source note|review --date YYYY-MM-DD [--question TEXT]
+  candidates.py add KEY --call ID --source note|call-review|review --date YYYY-MM-DD [--question TEXT]
   candidates.py evidence KEY
   candidates.py status KEY approved|shipped|rejected|watching [--pr URL]
 
@@ -69,7 +70,7 @@ def main():
     a = sub.add_parser("add")
     a.add_argument("key")
     a.add_argument("--call", required=True)
-    a.add_argument("--source", required=True, choices=("note", "review"))
+    a.add_argument("--source", required=True, choices=("note", "call-review", "review"))
     a.add_argument("--date", required=True)
     a.add_argument("--question")
     e = sub.add_parser("evidence")
