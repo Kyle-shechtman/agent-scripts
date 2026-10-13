@@ -3,7 +3,7 @@
 
   pull     read-only: every human golden-set answer, the reviewers' missing-question
            notes, and the transcripts the jury needs. Prints what production got
-           wrong on today's set. --call-review adds call-review's judge misses.
+           wrong on today's set. --call-review adds every call-review finding.
   run      ask the seated jury the full question batch as worded in an abita_s2s
            checkout, once, through its own evaluator, exactly as production does, on
            every golden call (and any extra calls). Prints false alarms and misses per
@@ -335,19 +335,23 @@ def ensure_out(out, fresh):
     return out
 
 
+def call_review_calls(path):
+    """Every finding a question should have flagged is a call whose answer is no, whatever the jury said then."""
+    by_question = json.loads(path.read_text())["by_question"]
+    return {q: sorted({*row["missed"], *row["caught"], *row["not_judged"]}) for q, row in by_question.items()}
+
+
 def pull(args):
     out = ensure_out(args.out, fresh=True)
     today = args.today or (datetime.now(PACIFIC).date() - timedelta(days=1)).isoformat()
-    call_review = {}
-    if args.call_review:
-        call_review = {q: row["missed"] for q, row in json.loads(args.call_review.read_text())["by_question"].items() if row["missed"]}
-    evidence = sorted({i for i in args.evidence.split(",") if i} | {i for ids in call_review.values() for i in ids})
+    call_review = call_review_calls(args.call_review) if args.call_review else {}
+    evidence = [i for i in args.evidence.split(",") if i]
     with database() as query:
         if query(GOLDEN_EXISTS) != ["t"]:
             sys.exit("ai_call_reviews is not in this database yet: ship the portal review tables first")
         rows = [json.loads(line) for line in query(GOLDEN_QUERY)]
         notes = [json.loads(line) for line in query(NOTES_QUERY)]
-        ids = sorted({row["interaction_id"] for row in rows} | set(evidence))
+        ids = sorted({row["interaction_id"] for row in rows} | set(evidence) | {i for c in call_review.values() for i in c})
         bad = [i for i in ids if not re.fullmatch(r"[0-9a-f-]{36}", i)]
         if bad:
             sys.exit(f"not interaction ids: {bad}")
@@ -365,7 +369,7 @@ def pull(args):
     summary["today"] = today
     summary["database"] = database_label()
     summary["today_review_dates"] = sorted({call["review_date"] for call in golden.values() if call["today"]})
-    summary["call_review_misses"] = {q: len(ids) for q, ids in call_review.items()}
+    summary["call_review_findings"] = {q: len(c) for q, c in call_review.items()}
     summary["question_notes"] = {"total": len(notes), "today": sum(1 for n in notes if golden.get(n["interaction_id"], {}).get("today"))}
     summary["missing_transcripts"] = [short(i) for i in ids if i not in transcripts]
     print(json.dumps(summary, indent=1))
@@ -397,7 +401,7 @@ async def run_jev(args):
     transcripts = json.loads((out / "transcripts.json").read_text())
     keys = [k for k, q in QUESTIONS.items() if q["type"] == "noul"]
     key = openrouter_key()
-    targets = sorted(set(data["calls"]) | set(data["evidence"]))
+    targets = sorted(set(data["calls"]) | set(data["evidence"]) | {i for c in data.get("call_review", {}).values() for i in c})
     semaphore = asyncio.Semaphore(4)
 
     async def one(interaction_id):
@@ -445,8 +449,8 @@ def main():
     p = sub.add_parser("pull")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--today", type=lambda v: date.fromisoformat(v).isoformat())
-    p.add_argument("--call-review", type=Path, help="judge_misses.json from a call-review run: misses only")
-    p.add_argument("--evidence", default="", help="interaction ids a new question must answer no on")
+    p.add_argument("--call-review", type=Path, help="judge_misses.json from a call-review run; each finding is a call whose answer is no")
+    p.add_argument("--evidence", default="", help="interaction ids a new question must answer no on (for --new)")
     r = sub.add_parser("run")
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--s2s", type=Path, required=True)

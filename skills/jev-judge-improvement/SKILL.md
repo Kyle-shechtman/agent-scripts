@@ -74,11 +74,11 @@ tool's call, arguments, or result) is a scorecard code check, not a judge.
    - Edit the wording in a branch worktree (`jev/reword-<question>-<today>`),
      keeping the fix its "no" points to, then `run --s2s <branch> --name
      <question>-<n>` and `compare --question <question> --baseline baseline
-     --candidate <question>-<n>`. call-review misses count as today's calls
+     --candidate <question>-<n>`. Every call-review finding counts as a call
      whose answer is no.
    - The gate passes only when the wording fixes at least one of today's
      false alarms or misses, regresses no call in any golden set or
-     call-review miss, and has no errors. Try at most three wordings.
+     call-review finding, and has no errors. Try at most three wordings.
    - On a pass, hand the diff to `build` in abita_s2s and open a **draft** PR
      with the `pr` skill. Its evidence is the compare output. If
      `acuity_product/backend/internal/interaction/scorecard.go` repeats the

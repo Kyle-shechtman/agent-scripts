@@ -142,16 +142,23 @@ class GoldenTest(unittest.TestCase):
             out = root / "out"
             out.mkdir()
             calls = self.golden()
-            (out / "golden.json").write_text(json.dumps({"today": "2026-10-08", "evidence": [], "call_review": {}, "calls": calls}))
-            (out / "transcripts.json").write_text(json.dumps({A: {"items": []}, B: {"items": []}, C: {"items": []}}))
+            (out / "golden.json").write_text(json.dumps({"today": "2026-10-08", "evidence": [], "call_review": {"right_help": [E]}, "calls": calls}))
+            (out / "transcripts.json").write_text(json.dumps({A: {"items": []}, B: {"items": []}, C: {"items": []}, E: {"items": []}}))
             args = argparse.Namespace(s2s=root / "s2s", out=out, name="t")
             with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test"}), contextlib.redirect_stdout(io.StringIO()):
                 asyncio.run(golden.run_jev(args))
             from abita_s2s.observability import evaluation
-            self.assertEqual(evaluation.CALLS, [{"api_key": "test", "seconds": 120}] * 3)
+            self.assertEqual(evaluation.CALLS, [{"api_key": "test", "seconds": 120}] * 4)
             answers = json.loads((out / "runs" / "t.json").read_text())["answers"]
             self.assertEqual(answers[A], {"right_help": {"verdict": False, "probability": 0.2, "votes": {"j": 0.2}}})
             self.assertEqual(answers[D], {"right_help": "error:no_transcript"})
+            self.assertIn(E, answers)
+
+    def test_every_call_review_finding_reaches_the_gate_not_only_the_misses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "judge_misses.json"
+            path.write_text(json.dumps({"by_question": {"promises_backed": {"findings": 4, "missed": [A], "caught": [B, A], "not_judged": [C]}}, "unassigned": []}))
+            self.assertEqual(golden.call_review_calls(path), {"promises_backed": [A, B, C]})
 
     def test_answer_of_reads_the_jury_result(self):
         judged = {"results": {"a": {"verdict": False, "probability": 0.2, "votes": {"j": 0.2}, "errors": {}}, "g": {"status": "not_applicable", "reason": "x"}}, "errors": {"b": {"cause": "no_quorum"}}}
